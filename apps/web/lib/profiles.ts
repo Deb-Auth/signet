@@ -106,12 +106,49 @@ export async function getProfile(handle: string): Promise<Profile | null> {
   return DEMO_MANIFEST[handle] ?? null;
 }
 
-export async function getOperations(handle: string): Promise<Operation[]> {
-  if (!isValidHandle(handle)) return [];
+/** Which layer answered an operations lookup; `none` when nothing did. */
+export type OperationsSource = 'database' | 'horizon' | 'demo' | 'none';
+
+/**
+ * An operations lookup together with how complete it is.
+ *
+ * Both the database and the Horizon layers read a bounded window rather than a
+ * developer's whole history: the indexer query takes the newest
+ * `DB_OPERATIONS_PER_WALLET` rows per wallet, and Horizon paging stops at its
+ * own cap. Whichever answered, a viewer has to be able to tell "did 400 things"
+ * apart from "did 40,000 things, we showed 400" — so the cap travels with the
+ * data and every surface that renders the list renders the caveat too.
+ */
+export interface OperationsResult {
+  /** The operations retrieved, newest first. */
+  operations: Operation[];
+  /** Which layer answered. */
+  source: OperationsSource;
+  /** True when a cap cut the record short — the list is a partial history. */
+  truncated: boolean;
+  /** The cap that produced the truncation, or null when nothing was capped. */
+  cap: number | null;
+}
+
+/**
+ * Render a count that may be a floor rather than a total. A truncated record
+ * only supports "at least N", never "N".
+ */
+export function formatCount(value: number, truncated: boolean): string {
+  return truncated ? `${value}+` : String(value);
+}
+
+/**
+ * Resolve a handle's operations along with their completeness. Prefer this over
+ * `getOperations` on any surface that shows the result to a person.
+ */
+export async function getOperationsResult(handle: string): Promise<OperationsResult> {
+  const empty: OperationsResult = { operations: [], source: 'none', truncated: false, cap: null };
+  if (!isValidHandle(handle)) return empty;
 
   // 1. Prefer indexer-populated DB rows (fastest, richest data including decoded_function).
-  const fromDb = await safeDbOperations(handle);
-  if (fromDb && fromDb.length > 0) return fromDb;
+  const fromDb = await safeDbOperationsResult(handle);
+  if (fromDb && fromDb.operations.length > 0) return { ...fromDb, source: 'database' };
 
   // 2. Horizon fallback: fetch invoke_host_function ops for the bound wallet directly
   //    from the Horizon API. This makes claimed handles work without a database.
@@ -123,13 +160,32 @@ export async function getOperations(handle: string): Promise<Operation[]> {
     if (profile?.wallet) {
       const { fetchHorizonOperations } = await import('./server/horizon.ts');
       const fromHorizon = await fetchHorizonOperations(profile.wallet);
-      if (fromHorizon && fromHorizon.length > 0) return fromHorizon;
+      if (fromHorizon && fromHorizon.operations.length > 0) {
+        return {
+          operations: fromHorizon.operations,
+          source: 'horizon',
+          truncated: fromHorizon.truncated,
+          cap: fromHorizon.truncated ? fromHorizon.cap : null,
+        };
+      }
     }
   }
 
   // 3. Static demo JSON (for the curated demo handles: aquawolf, sorobuilder, stellardev).
   const data = await readJson<{ _embedded?: { records?: Operation[] } }>(`${handle}.json`);
-  return data?._embedded?.records ?? [];
+  const records = data?._embedded?.records ?? [];
+  if (records.length === 0) return empty;
+  // The curated files are the whole of what a demo persona ever did.
+  return { operations: records, source: 'demo', truncated: false, cap: null };
+}
+
+/**
+ * Operations for a handle, without completeness metadata. Kept for callers that
+ * only aggregate (e.g. `computeStats`); anything that renders a list or a count
+ * to a viewer should use `getOperationsResult` so it can disclose truncation.
+ */
+export async function getOperations(handle: string): Promise<Operation[]> {
+  return (await getOperationsResult(handle)).operations;
 }
 
 export interface ProfileStats {
@@ -316,11 +372,21 @@ export async function safeChainProfile(handle: string): Promise<Profile | null> 
 }
 
 /**
- * Best-effort lookup of indexer-populated operations for a handle. Returns null
- * on any failure (no DB, unreachable, error) so `getOperations` falls back to
+ * Newest indexer rows read per wallet. Like the Horizon cap, this bounds the
+ * query rather than the developer's history, so a wallet that fills the window
+ * yields a partial record — reported as `truncated`, never rendered as whole.
+ */
+export const DB_OPERATIONS_PER_WALLET = 100;
+
+/**
+ * Best-effort lookup of indexer-populated operations for a handle, together
+ * with the completeness of the read. Returns null on any failure (no DB,
+ * unreachable, error) so `getOperationsResult` falls back to Horizon and then
  * the static JSON. Maps DB rows to the Horizon-shaped `Operation` the UI uses.
  */
-export async function safeDbOperations(handle: string): Promise<Operation[] | null> {
+export async function safeDbOperationsResult(
+  handle: string,
+): Promise<Omit<OperationsResult, 'source'> | null> {
   if (!process.env.DATABASE_URL || !isValidHandle(handle)) return null;
   try {
     const { prisma } = await import('@signet/db');
@@ -328,12 +394,19 @@ export async function safeDbOperations(handle: string): Promise<Operation[] | nu
       where: { handle: handle.toLowerCase() },
       include: {
         wallets: {
-          include: { operations: { orderBy: { createdAt: 'desc' }, take: 100 } },
+          include: {
+            operations: { orderBy: { createdAt: 'desc' }, take: DB_OPERATIONS_PER_WALLET },
+          },
         },
       },
     });
     if (!profile) return null;
-    return profile.wallets
+    // A wallet whose window came back full has older rows we did not read.
+    let truncated = false;
+    for (const wallet of profile.wallets) {
+      if (wallet.operations.length >= DB_OPERATIONS_PER_WALLET) truncated = true;
+    }
+    const operations = profile.wallets
       .flatMap((w) => w.operations)
       .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
       .map((op) => ({
@@ -348,7 +421,17 @@ export async function safeDbOperations(handle: string): Promise<Operation[] | nu
         asset_balance_changes:
           (op.balanceChanges as unknown as Operation['asset_balance_changes']) ?? undefined,
       }));
+    return { operations, truncated, cap: truncated ? DB_OPERATIONS_PER_WALLET : null };
   } catch {
     return null;
   }
+}
+
+/**
+ * Indexer operations without completeness metadata, for callers that only need
+ * the rows. Prefer `safeDbOperationsResult` wherever the result is displayed.
+ */
+export async function safeDbOperations(handle: string): Promise<Operation[] | null> {
+  const result = await safeDbOperationsResult(handle);
+  return result ? result.operations : null;
 }
