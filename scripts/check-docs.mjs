@@ -153,6 +153,8 @@ const NOT_ENV_IDENTIFIERS = new Set([
   'BASE_FEE', // @stellar/stellar-sdk constant
   'MAX_BATCH_SIZE', // identity-registry contract constant
   'MAX_HANDLE_LEN', // identity-registry contract constant
+  'DB_OPERATIONS_PER_WALLET', // apps/web/lib/profiles.ts — bounded read, not config
+  'HORIZON_MAX_RECORDS', // apps/web/lib/server/horizon.ts — bounded read, not config
 ]);
 
 /** Backticked SCREAMING_SNAKE with an underscore — typical env var citation. */
